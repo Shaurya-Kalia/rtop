@@ -1,0 +1,11 @@
+[package]
+name = "rtop"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+sysinfo = { version = "0.38", default-features = false, features = ["system", "disk", "network"] }
+anyhow = "1.0"
+libc = "0.2"
