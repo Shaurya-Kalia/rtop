@@ -18,9 +18,10 @@ I made `rtop` because I wanted a system monitor that showed more AMD GPU telemet
 
 ## Compatibility
 
-`rtop` is designed for **Linux**. Its system metrics use Linux interfaces such as `/proc` and `/sys`.
+`rtop` is designed for **Me**. It is tuned for my setup with ryzen 9700X with amd 7800XT, and contains some hardcoded values (like CPU freq).
 
 GPU monitoring is implemented for **AMD GPUs using the Linux `amdgpu` driver**. I don't have NVIDIA or Intel GPUs available for development and testing, so support for those vendors is not planned. Please don't open issues requesting support for non-AMD GPUs.
+I would be happy to implement general support for more CPUs and GPUs (if AMD) if there is any interest.
 
 Some readings—especially VCN and per-process GPU activity, as well as temperatures, power, clocks, and fan speed—depend on the information exposed by your kernel, driver, and hardware. If a counter or sensor is unavailable, the corresponding value may be zero or inaccurate.
 
