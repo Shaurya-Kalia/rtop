@@ -1,6 +1,9 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,11 +16,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, StatefulWidget, Table, TableState, Widget,
+        ScrollbarState, Table, TableState, Widget,
     },
     Frame, Terminal,
 };
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     ffi::CString,
     fs, io,
@@ -25,8 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::{
-    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate,
-    System, UpdateKind,
+    CpuRefreshKind, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, System,
+    UpdateKind,
 };
 
 const HISTORY_LEN: usize = 160;
@@ -35,6 +39,40 @@ const HISTORY_LEN: usize = 160;
 enum FocusPanel {
     Processes,
     Disks,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ProcSortCol {
+    Pid,
+    Program,
+    Command,
+    Mem,
+    Cpu,
+    Gpu,
+}
+
+impl ProcSortCol {
+    fn next(self) -> Self {
+        match self {
+            Self::Pid => Self::Program,
+            Self::Program => Self::Command,
+            Self::Command => Self::Mem,
+            Self::Mem => Self::Cpu,
+            Self::Cpu => Self::Gpu,
+            Self::Gpu => Self::Pid,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Pid => Self::Gpu,
+            Self::Program => Self::Pid,
+            Self::Command => Self::Program,
+            Self::Mem => Self::Command,
+            Self::Cpu => Self::Mem,
+            Self::Gpu => Self::Cpu,
+        }
+    }
 }
 
 /// Custom Block-Style Graph with vertical RGB Gradient toward White (255, 255, 255).
@@ -63,8 +101,6 @@ impl<'a> BlockGraph<'a> {
         self
     }
 
-    /// Interpolates from `base_rgb` at `row = 0` (baseline) to pure White `(255, 255, 255)`
-    /// at the furthest row (`height - 1`).
     fn row_gradient_color(&self, row: u16, total_height: u16) -> Color {
         let t = if total_height <= 1 {
             0.0
@@ -149,9 +185,7 @@ impl<'a> Widget for BlockGraph<'a> {
     }
 }
 
-/// Vertically centered meter bar:
-/// Uses '■' (U+25A0, centered medium block) for filled and '▪' (U+25AA, centered small square)
-/// so the bar sits symmetrically on the text midline with equal top and bottom margin.
+/// Vertically centered meter bar
 fn make_block_bar(pct: u64, width: usize) -> (String, String) {
     let filled = ((pct.min(100) as usize) * width) / 100;
     let empty = width.saturating_sub(filled);
@@ -233,7 +267,6 @@ impl CpuTelemetry {
     }
 }
 
-
 #[derive(Default, Clone)]
 struct AmdGpuStats {
     card_path: Option<PathBuf>,
@@ -255,7 +288,6 @@ struct AmdGpuStats {
     prev_enc_ns: u64,
     prev_pid_gpu_ns: HashMap<u32, u64>,
     pid_gpu_pct: HashMap<u32, f32>,
-    // Cache of (pid, fdinfo_path) that actually belong to amdgpu, refreshed every 10 ticks
     cached_drm_fds: Vec<(u32, PathBuf)>,
     tick_counter: u32,
     last_sample: Option<Instant>,
@@ -320,13 +352,13 @@ impl AmdGpuStats {
             self.fan_rpm = read_sysfs_u64(&hwmon.join("fan1_input"));
         }
 
-        // Re-discover open /dev/dri/* file descriptors only once every 10 ticks (5 seconds)
         if self.tick_counter % 10 == 0 || self.cached_drm_fds.is_empty() {
             self.cached_drm_fds = discover_amd_drm_fds();
         }
         self.tick_counter = self.tick_counter.wrapping_add(1);
 
-        let (cur_dec_ns, cur_enc_ns, cur_pid_ns) = sample_cached_amd_fdinfo(&mut self.cached_drm_fds);
+        let (cur_dec_ns, cur_enc_ns, cur_pid_ns) =
+        sample_cached_amd_fdinfo(&mut self.cached_drm_fds);
         if self.prev_dec_ns > 0 && cur_dec_ns >= self.prev_dec_ns {
             let delta_dec = cur_dec_ns - self.prev_dec_ns;
             self.vcn_dec_pct = ((delta_dec * 100) / dt_ns).min(100);
@@ -359,7 +391,6 @@ impl AmdGpuStats {
     }
 }
 
-/// Runs once every 5 seconds to find which (pid, fdinfo_path) belong to /dev/dri/*
 fn discover_amd_drm_fds() -> Vec<(u32, PathBuf)> {
     let mut drm_fds = Vec::new();
     let Ok(proc_entries) = fs::read_dir("/proc") else {
@@ -389,14 +420,13 @@ fn discover_amd_drm_fds() -> Vec<(u32, PathBuf)> {
     drm_fds
 }
 
-/// Fast path: only reads the ~15-30 cached fdinfo files on each 500ms tick!
 fn sample_cached_amd_fdinfo(cached_fds: &mut Vec<(u32, PathBuf)>) -> (u64, u64, HashMap<u32, u64>) {
     let mut client_vcn: HashMap<String, (u64, u64)> = HashMap::new();
     let mut pid_client_total: HashMap<(u32, String), u64> = HashMap::new();
 
     cached_fds.retain(|&(pid, ref fdinfo_path)| {
         let Ok(content) = fs::read_to_string(fdinfo_path) else {
-            return false; // Drop closed FD from cache immediately
+            return false;
         };
         if !content.contains("drm-driver:\tamdgpu") {
             return false;
@@ -490,7 +520,7 @@ struct DiskEntry {
     write_mb_s: f64,
 }
 
-fn statvfs_path(path: &str) -> Option<(u64, u64, String)> {
+fn statvfs_path(path: &str) -> Option<(u64, u64)> {
     let c_path = CString::new(path).ok()?;
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
@@ -498,11 +528,19 @@ fn statvfs_path(path: &str) -> Option<(u64, u64, String)> {
             let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
             let avail = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
             if total > 0 {
-                return Some((total, avail, String::new()));
+                return Some((total, avail));
             }
         }
     }
     None
+}
+
+/// Unescapes octal sequences like `\040` (space) in `/proc/mounts` mount paths
+fn unescape_mount_path(raw: &str) -> String {
+    raw.replace("\\040", " ")
+    .replace("\\011", "\t")
+    .replace("\\012", "\n")
+    .replace("\\134", "\\")
 }
 
 fn read_diskstats_sectors() -> HashMap<String, (u64, u64)> {
@@ -522,10 +560,19 @@ fn read_diskstats_sectors() -> HashMap<String, (u64, u64)> {
     map
 }
 
+/// Resolves `/dev/...` (including `/dev/disk/by-uuid/...` or `/dev/mapper/...`) to short kernel device name (`nvme0n1p2`, `sda1`, `dm-0`)
+fn resolve_short_dev(dev_path: &str) -> String {
+    if let Ok(canon) = fs::canonicalize(dev_path) {
+        if let Some(name) = canon.file_name() {
+            return name.to_string_lossy().to_string();
+        }
+    }
+    dev_path.trim_start_matches("/dev/").to_string()
+}
+
 struct App {
     start_time: Instant,
     sys: System,
-    disks: Disks,
     networks: Networks,
     cpu_telemetry: CpuTelemetry,
     gpu: AmdGpuStats,
@@ -541,6 +588,10 @@ struct App {
     disk_entries: Vec<DiskEntry>,
     focus: FocusPanel,
     proc_state: TableState,
+    proc_sort_col: ProcSortCol,
+    proc_sort_desc: bool,
+    proc_inner_rect: Rect,
+    disk_inner_rect: Rect,
     disk_scroll: usize,
 }
 
@@ -554,7 +605,6 @@ impl App {
         let mut app = Self {
             start_time: Instant::now(),
             sys,
-            disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             cpu_telemetry: CpuTelemetry::new(),
             gpu: AmdGpuStats::new(),
@@ -570,11 +620,16 @@ impl App {
             disk_entries: Vec::new(),
             focus: FocusPanel::Processes,
             proc_state,
+            proc_sort_col: ProcSortCol::Cpu,
+            proc_sort_desc: true,
+            proc_inner_rect: Rect::default(),
+            disk_inner_rect: Rect::default(),
             disk_scroll: 0,
         };
         app.refresh_disk_entries();
         app
     }
+
 
     fn refresh_disk_entries(&mut self) {
         let now = Instant::now();
@@ -592,101 +647,120 @@ impl App {
         }
         self.prev_disk_sectors = cur_sectors;
 
-        let mut mount_to_dev: HashMap<String, String> = HashMap::new();
-        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-            for line in mounts.lines() {
+        // Parse live mounts from /proc/mounts
+        let mut raw_mounts: Vec<(String, String, String)> = Vec::new();
+        if let Ok(mounts_content) = fs::read_to_string("/proc/mounts") {
+            for line in mounts_content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts[0].starts_with("/dev/") {
-                    let short_dev = parts[0].trim_start_matches("/dev/").to_string();
-                    mount_to_dev.insert(parts[1].to_string(), short_dev);
+                if parts.len() >= 3 && parts[0].starts_with("/dev/") {
+                    let dev_raw = parts[0];
+                    // Ignore loop devices, ramdisks, zram block devices
+                    if dev_raw.starts_with("/dev/loop") || dev_raw.starts_with("/dev/ram") {
+                        continue;
+                    }
+                    let short_dev = resolve_short_dev(dev_raw);
+                    let mount_point = unescape_mount_path(parts[1]);
+                    let fs_type = parts[2].to_string();
+                    raw_mounts.push((short_dev, mount_point, fs_type));
                 }
             }
         }
 
-        let root_dev = mount_to_dev.get("/").cloned().unwrap_or_default();
         let mut entries = Vec::new();
-        let mut seen_mounts = HashSet::new();
+        let mut seen_devs = HashSet::new();
 
-        let pinned = [
-            ("/", "root (/)"),
-            ("/home", "/home"),
-            ("/tmp", "/tmp"),
-            ("swap", "swap"),
-            ("/var/log", "log (/var/log)"),
-        ];
-
-        for (mount_path, display_name) in pinned {
-            if mount_path == "swap" {
-                let total_swap = self.sys.total_swap() as f64 / 1_073_741_824.0;
-                let used_swap = self.sys.used_swap() as f64 / 1_073_741_824.0;
-                let avail_swap = (total_swap - used_swap).max(0.0);
-                entries.push(DiskEntry {
-                    label: display_name.to_string(),
-                             total_gb: total_swap,
-                             used_gb: used_swap,
-                             avail_gb: avail_swap,
-                             read_mb_s: 0.0,
-                             write_mb_s: 0.0,
-                });
-                continue;
-            }
-
-            seen_mounts.insert(mount_path.to_string());
-            if let Some((total_b, avail_b, _)) = statvfs_path(mount_path) {
-                let total_gb = total_b as f64 / 1_073_741_824.0;
-                let avail_gb = avail_b as f64 / 1_073_741_824.0;
-                let used_gb = (total_gb - avail_gb).max(0.0);
-                let dev = mount_to_dev
-                .get(mount_path)
-                .cloned()
-                .unwrap_or_else(|| root_dev.clone());
-                let (r_mb, w_mb) = dev_io_mb.get(&dev).copied().unwrap_or((0.0, 0.0));
-                entries.push(DiskEntry {
-                    label: display_name.to_string(),
-                             total_gb,
-                             used_gb,
-                             avail_gb,
-                             read_mb_s: r_mb,
-                             write_mb_s: w_mb,
-                });
-            }
-        }
-
-        for disk in self.disks.list() {
-            let mount_str = disk.mount_point().to_string_lossy().to_string();
-            if seen_mounts.contains(&mount_str)
-                || mount_str.starts_with("/boot")
-                || mount_str.starts_with("/run")
-                || mount_str.starts_with("/sys")
-                || mount_str.starts_with("/proc")
-                || mount_str.starts_with("/dev")
-                {
-                    continue;
-                }
-                seen_mounts.insert(mount_str.clone());
-            let total_gb = disk.total_space() as f64 / 1_073_741_824.0;
-            if total_gb < 0.1 {
-                continue;
-            }
-            let avail_gb = disk.available_space() as f64 / 1_073_741_824.0;
+        // 1. Pinned: root (/)
+        if let Some((total_b, avail_b)) = statvfs_path("/") {
+            let total_gb = total_b as f64 / 1_073_741_824.0;
+            let avail_gb = avail_b as f64 / 1_073_741_824.0;
             let used_gb = (total_gb - avail_gb).max(0.0);
-            let dev = mount_to_dev
-            .get(&mount_str)
-            .cloned()
-            .unwrap_or_else(|| root_dev.clone());
-            let (r_mb, w_mb) = dev_io_mb.get(&dev).copied().unwrap_or((0.0, 0.0));
-
+            let root_dev = raw_mounts
+            .iter()
+            .find(|(_, mp, _)| mp == "/")
+            .map(|(d, _, _)| d.clone())
+            .unwrap_or_default();
+            if !root_dev.is_empty() {
+                seen_devs.insert(root_dev.clone());
+            }
+            let (r_mb, w_mb) = dev_io_mb.get(&root_dev).copied().unwrap_or((0.0, 0.0));
             entries.push(DiskEntry {
-                label: mount_str,
-                total_gb,
-                used_gb,
-                avail_gb,
-                read_mb_s: r_mb,
-                write_mb_s: w_mb,
+                label: "root (/)".to_string(),
+                         total_gb,
+                         used_gb,
+                         avail_gb,
+                         read_mb_s: r_mb,
+                         write_mb_s: w_mb,
             });
         }
 
+        // 2. Pinned: swap
+        let total_swap = self.sys.total_swap() as f64 / 1_073_741_824.0;
+        let used_swap = self.sys.used_swap() as f64 / 1_073_741_824.0;
+        let avail_swap = (total_swap - used_swap).max(0.0);
+        if total_swap > 0.0 {
+            entries.push(DiskEntry {
+                label: "swap".to_string(),
+                         total_gb: total_swap,
+                         used_gb: used_swap,
+                         avail_gb: avail_swap,
+                         read_mb_s: 0.0,
+                         write_mb_s: 0.0,
+            });
+        }
+
+        // 3. Dynamic physical partitions (mounted internal/external drives not sharing the root block device)
+        for (short_dev, mount_point, fs_type) in raw_mounts {
+            if mount_point == "/"
+                || seen_devs.contains(&short_dev)
+                || mount_point.starts_with("/boot")
+                || mount_point.starts_with("/run/credentials")
+                || mount_point.starts_with("/sys")
+                || mount_point.starts_with("/proc")
+                || mount_point.starts_with("/dev")
+                || mount_point.contains("waydroid")
+                || matches!(
+                    fs_type.as_str(),
+                            "squashfs" | "tmpfs" | "devtmpfs" | "overlay" | "iso9660"
+                )
+                {
+                    continue;
+                }
+
+                if let Some((total_b, avail_b)) = statvfs_path(&mount_point) {
+                    let total_gb = total_b as f64 / 1_073_741_824.0;
+                    if total_gb < 0.1 {
+                        continue;
+                    }
+                    seen_devs.insert(short_dev.clone());
+                    let avail_gb = avail_b as f64 / 1_073_741_824.0;
+                    let used_gb = (total_gb - avail_gb).max(0.0);
+                    let (r_mb, w_mb) = dev_io_mb.get(&short_dev).copied().unwrap_or((0.0, 0.0));
+
+                    // Show concise label for /run/media/$USER/DriveName or /mnt/Partition
+                    let clean_label = if let Some(short) = mount_point
+                    .strip_prefix("/run/media/")
+                    .and_then(|s| s.split_once('/').map(|(_, name)| name))
+                    {
+                        short.to_string()
+                    } else {
+                        mount_point
+                    };
+
+                    entries.push(DiskEntry {
+                        label: clean_label,
+                        total_gb,
+                        used_gb,
+                        avail_gb,
+                        read_mb_s: r_mb,
+                        write_mb_s: w_mb,
+                    });
+                }
+        }
+
         self.disk_entries = entries;
+        if self.disk_scroll >= self.disk_entries.len() && !self.disk_entries.is_empty() {
+            self.disk_scroll = self.disk_entries.len() - 1;
+        }
     }
 
     fn on_tick(&mut self) {
@@ -701,7 +775,6 @@ impl App {
             .with_memory()
             .with_cmd(UpdateKind::OnlyIfNotSet),
         );
-        self.disks.refresh(true);
         self.networks.refresh(true);
         self.cpu_telemetry.update();
         self.gpu.update();
@@ -735,6 +808,57 @@ impl App {
         self.net_rx_history.push_back(rx_kib);
         self.net_tx_history.pop_front();
         self.net_tx_history.push_back(tx_kib);
+    }
+
+    fn set_sort_col(&mut self, col: ProcSortCol) {
+        if self.proc_sort_col == col {
+            self.proc_sort_desc = !self.proc_sort_desc;
+        } else {
+            self.proc_sort_col = col;
+            // Default to ascending for alphabetical/PID columns, descending for resource usage
+            self.proc_sort_desc = matches!(col, ProcSortCol::Mem | ProcSortCol::Cpu | ProcSortCol::Gpu);
+        }
+        self.proc_state.select(Some(0));
+    }
+
+    fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        let p = self.proc_inner_rect;
+        if col >= p.x && col < p.x + p.width && row >= p.y && row < p.y + p.height {
+            self.focus = FocusPanel::Processes;
+            // Clicking the top header row of the proc table sorts by the clicked column
+            if row == p.y {
+                let rel_x = col - p.x;
+                let cmd_end = p.width.saturating_sub(18);
+                let clicked_col = if rel_x < 8 {
+                    ProcSortCol::Pid
+                } else if rel_x < 22 {
+                    ProcSortCol::Program
+                } else if rel_x < cmd_end {
+                    ProcSortCol::Command
+                } else if rel_x < cmd_end + 6 {
+                    ProcSortCol::Mem
+                } else if rel_x < cmd_end + 12 {
+                    ProcSortCol::Cpu
+                } else {
+                    ProcSortCol::Gpu
+                };
+                self.set_sort_col(clicked_col);
+            } else {
+                // Clicking a process row selects it
+                let clicked_offset = (row - p.y - 1) as usize;
+                let current_offset = self.proc_state.offset();
+                let target = current_offset + clicked_offset;
+                if target < self.sys.processes().len() {
+                    self.proc_state.select(Some(target));
+                }
+            }
+            return;
+        }
+
+        let d = self.disk_inner_rect;
+        if col >= d.x && col < d.x + d.width && row >= d.y && row < d.y + d.height {
+            self.focus = FocusPanel::Disks;
+        }
     }
 
     fn scroll_down(&mut self) {
@@ -804,7 +928,7 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
                       Span::styled("poll: 500ms ", Style::default().fg(Color::Yellow)),
                       Span::raw("── "),
                       Span::styled(
-                          "(Tab: switch panel | ↑/↓: scroll | q: quit) ",
+                          "(Tab: panel | p/n/d/m/c/g or click: sort | r: rev | q: quit) ",
                                    Style::default().fg(Color::Gray),
                       ),
     ]))
@@ -829,7 +953,6 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
     ])
     .split(horiz[0]);
 
-    // CPU Graph: Bottom-up gradient from Green (46, 204, 113) -> White (255, 255, 255)
     let cur_cpu = app.cpu_history.back().copied().unwrap_or(0);
     let cpu_graph = BlockGraph::new(&app.cpu_history, 100, false, (46, 204, 113))
     .label(format!("CPU Usage: {:>3}%", cur_cpu));
@@ -844,7 +967,6 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
         graph_chunks[1],
     );
 
-    // GPU Graph: Top-down gradient from Lime Green (80, 220, 100) -> White (255, 255, 255)
     let cur_gpu = app.gpu_history.back().copied().unwrap_or(0);
     let gpu_graph = BlockGraph::new(&app.gpu_history, 100, true, (80, 220, 100))
     .label(format!("GPU Usage: {:>3}%", cur_gpu));
@@ -1264,6 +1386,7 @@ fn draw_disks_box(f: &mut Frame, app: &mut App, area: Rect) {
     .border_style(Style::default().fg(border_col));
 
     let inner = block.inner(area);
+    app.disk_inner_rect = inner;
     f.render_widget(block, area);
 
     let mut lines = Vec::new();
@@ -1354,7 +1477,6 @@ fn draw_net_box(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Added Constraint::Length(3) to create a clean spacing column between graphs and text
     let split = Layout::default()
     .direction(Direction::Horizontal)
     .constraints([
@@ -1371,7 +1493,7 @@ fn draw_net_box(f: &mut Frame, app: &App, area: Rect) {
                  Constraint::Length(1),
                  Constraint::Percentage(48),
     ])
-    .split(split[0]); // Rendered in the first split section
+    .split(split[0]);
 
     let dl_graph = BlockGraph::new(&app.net_rx_history, app.peak_rx_kib, false, (26, 188, 156))
     .label("▼ DL");
@@ -1436,8 +1558,49 @@ fn draw_net_box(f: &mut Frame, app: &App, area: Rect) {
         )),
     ];
 
-    // Rendered into split[2], skipping split[1] (the empty spacing column)
     f.render_widget(Paragraph::new(info), split[2]);
+}
+
+/// Builds a column header cell with an underlined shortcut character and sort direction arrow
+fn make_sort_header(
+    prefix: &'static str,
+    underlined_key: &'static str,
+    suffix: &'static str,
+    col: ProcSortCol,
+    active_col: ProcSortCol,
+    desc: bool,
+) -> Cell<'static> {
+    let is_active = col == active_col;
+    let base_color = if is_active {
+        Color::Yellow
+    } else {
+        Color::White
+    };
+    let base_style = Style::default()
+    .fg(base_color)
+    .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+    .fg(if is_active { Color::Yellow } else { Color::Cyan })
+    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let arrow = if is_active {
+        if desc {
+            "▼"
+        } else {
+            "▲"
+        }
+    } else {
+        ""
+    };
+
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, base_style));
+    }
+    spans.push(Span::styled(underlined_key, key_style));
+    spans.push(Span::styled(format!("{}{}", suffix, arrow), base_style));
+
+    Cell::from(Line::from(spans))
 }
 
 fn draw_proc_box(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1464,27 +1627,69 @@ fn draw_proc_box(f: &mut Frame, app: &mut App, area: Rect) {
             format!("── {}/{} ", selected_idx + 1, total_procs),
                 Style::default().fg(Color::Gray),
         ),
+        Span::styled(
+            "(sort: [p]id [n]ame cm[d] [m]em [c]pu [g]pu | [r]everse) ",
+                     Style::default().fg(Color::DarkGray),
+        ),
     ]))
     .borders(Borders::ALL)
     .border_set(symbols::border::ROUNDED)
     .border_style(Style::default().fg(border_col));
 
     let inner = block.inner(area);
+    app.proc_inner_rect = inner;
     f.render_widget(block, area);
 
     let mut procs: Vec<_> = app.sys.processes().values().collect();
+    let sort_col = app.proc_sort_col;
+    let desc = app.proc_sort_desc;
+    let gpu_map = &app.gpu.pid_gpu_pct;
+
     procs.sort_by(|a, b| {
-        b.cpu_usage()
-        .partial_cmp(&a.cpu_usage())
-        .unwrap_or(std::cmp::Ordering::Equal)
+        let ord = match sort_col {
+            ProcSortCol::Pid => a.pid().as_u32().cmp(&b.pid().as_u32()),
+                  ProcSortCol::Program => a
+                  .name()
+                  .to_string_lossy()
+                  .to_lowercase()
+                  .cmp(&b.name().to_string_lossy().to_lowercase()),
+                  ProcSortCol::Command => {
+                      let cmd_a = a.cmd().first().map(|s| s.to_string_lossy()).unwrap_or_else(|| a.name().to_string_lossy());
+                      let cmd_b = b.cmd().first().map(|s| s.to_string_lossy()).unwrap_or_else(|| b.name().to_string_lossy());
+                      cmd_a.to_lowercase().cmp(&cmd_b.to_lowercase())
+                  }
+                  ProcSortCol::Mem => a.memory().cmp(&b.memory()),
+                  ProcSortCol::Cpu => a
+                  .cpu_usage()
+                  .partial_cmp(&b.cpu_usage())
+                  .unwrap_or(Ordering::Equal),
+                  ProcSortCol::Gpu => {
+                      let ga = gpu_map.get(&a.pid().as_u32()).copied().unwrap_or(0.0);
+                      let gb = gpu_map.get(&b.pid().as_u32()).copied().unwrap_or(0.0);
+                      ga.partial_cmp(&gb)
+                      .unwrap_or(Ordering::Equal)
+                      .then_with(|| {
+                          a.cpu_usage()
+                          .partial_cmp(&b.cpu_usage())
+                          .unwrap_or(Ordering::Equal)
+                      })
+                  }
+        };
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
     });
 
-    let header = Row::new(vec!["Pid:", "Program:", "Command:", "MemB", "Cpu%", "Gpu%"])
-    .style(
-        Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(vec![
+        make_sort_header("", "P", "id:", ProcSortCol::Pid, sort_col, desc),
+                          make_sort_header("", "N", "ame:", ProcSortCol::Program, sort_col, desc),
+                          make_sort_header("Cm", "d", ":", ProcSortCol::Command, sort_col, desc),
+                          make_sort_header("", "M", "emB", ProcSortCol::Mem, sort_col, desc),
+                          make_sort_header("", "C", "pu%", ProcSortCol::Cpu, sort_col, desc),
+                          make_sort_header("", "G", "pu%", ProcSortCol::Gpu, sort_col, desc),
+    ]);
 
     let rows: Vec<Row> = procs
     .into_iter()
@@ -1547,7 +1752,7 @@ fn draw_proc_box(f: &mut Frame, app: &mut App, area: Rect) {
 fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1560,31 +1765,62 @@ fn main() -> Result<()> {
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Tab => {
-                            app.focus = match app.focus {
-                                FocusPanel::Processes => FocusPanel::Disks,
-                                FocusPanel::Disks => FocusPanel::Processes,
-                            };
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
-                        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-                        KeyCode::PageDown => {
-                            for _ in 0..10 {
-                                app.scroll_down();
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            for _ in 0..10 {
-                                app.scroll_up();
-                            }
-                        }
-                        _ => {}
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab => {
+                        app.focus = match app.focus {
+                            FocusPanel::Processes => FocusPanel::Disks,
+                            FocusPanel::Disks => FocusPanel::Processes,
+                        };
                     }
-                }
+                    // Direct column sort hotkeys (matching underlined letters in proc header)
+                    KeyCode::Char('p') | KeyCode::Char('P') => app.set_sort_col(ProcSortCol::Pid),
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        app.set_sort_col(ProcSortCol::Program)
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        app.set_sort_col(ProcSortCol::Command)
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => app.set_sort_col(ProcSortCol::Mem),
+                    KeyCode::Char('c') | KeyCode::Char('C') => app.set_sort_col(ProcSortCol::Cpu),
+                    KeyCode::Char('g') | KeyCode::Char('G') => app.set_sort_col(ProcSortCol::Gpu),
+                    // Reverse current sort order
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        app.proc_sort_desc = !app.proc_sort_desc;
+                    }
+                    // Left/Right arrows cycle sort columns
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        let next_col = app.proc_sort_col.next();
+                        app.set_sort_col(next_col);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        let prev_col = app.proc_sort_col.prev();
+                        app.set_sort_col(prev_col);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+                    KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
+                    KeyCode::PageDown => {
+                        for _ in 0..10 {
+                            app.scroll_down();
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        for _ in 0..10 {
+                            app.scroll_up();
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        app.handle_mouse_click(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::ScrollDown => app.scroll_down(),
+                    MouseEventKind::ScrollUp => app.scroll_up(),
+                    _ => {}
+                },
+                _ => {}
             }
         }
 
@@ -1595,7 +1831,11 @@ fn main() -> Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+             LeaveAlternateScreen,
+             DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
