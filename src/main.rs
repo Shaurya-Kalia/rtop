@@ -241,6 +241,8 @@ impl CpuTelemetry {
                     }
                 }
             }
+            // If the sensor driver is AMD k10temp, it exposes 1 temperature per CCD (Tccd1, Tccd2)
+            // rather than per-thread sensors. Distribute CCD temperature across its cores!
             self.core_temps_c = c_temps;
 
             let p_avg = read_sysfs_u64(&hwmon.join("power1_average"));
@@ -1098,11 +1100,21 @@ fn format_core_column(
     let usage = cpu.cpu_usage() as u64;
     let freq_ghz = cpu.frequency() as f64 / 1000.0;
     let freq_pct = ((freq_ghz / 5.7) * 100.0).min(100.0) as u64;
-    let core_temp = telemetry
-    .core_temps_c
-    .get(idx)
-    .copied()
-    .unwrap_or(telemetry.package_temp_c);
+    let core_temp = if telemetry.core_temps_c.len() == 1 {
+        // Single-CCD AMD CPU (e.g., Ryzen 7 9700X): temp3_input is Tccd1 for all cores
+        telemetry.core_temps_c[0]
+    }
+        else if telemetry.core_temps_c.len() == 2 {
+        // Dual-CCD AMD CPU (e.g., Ryzen 9 9900X/9950X): split cores across Tccd1 and Tccd2
+        telemetry.core_temps_c[idx % 2]
+    }
+        else {
+        telemetry
+        .core_temps_c
+        .get(idx)
+        .copied()
+        .unwrap_or(telemetry.package_temp_c)
+    };
 
     let (u_fill, u_emp) = make_block_bar(usage, 7);
     let (f_fill, f_emp) = make_block_bar(freq_pct, 7);
@@ -1389,8 +1401,13 @@ fn draw_disks_box(f: &mut Frame, app: &mut App, area: Rect) {
     app.disk_inner_rect = inner;
     f.render_widget(block, area);
 
+    // Reserve 1 column on the right for the vertical scrollbar so text never collides with it
+    let usable_w = inner.width.saturating_sub(1) as usize;
+    let compact_mode = usable_w < 38;
+    let lines_per_item = if compact_mode { 3 } else { 2 };
+    let visible_items = (inner.height as usize / lines_per_item).max(1);
+
     let mut lines = Vec::new();
-    let visible_items = (inner.height as usize / 2).max(1);
 
     for disk in app
         .disk_entries
@@ -1403,24 +1420,6 @@ fn draw_disks_box(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 0
             };
-            let (u_f, u_e) = make_block_bar(pct, 8);
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<15}", disk.label),
-                        Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("Tot:{:>4.0}G  ", disk.total_gb),
-                        Style::default().fg(Color::Gray),
-                ),
-                Span::styled(
-                    format!("Free:{:>4.0}G", disk.avail_gb),
-                        Style::default().fg(Color::LightGreen),
-                ),
-            ]));
 
             let r_col = if disk.read_mb_s > 0.05 {
                 Color::Cyan
@@ -1433,20 +1432,92 @@ fn draw_disks_box(f: &mut Frame, app: &mut App, area: Rect) {
                 Color::DarkGray
             };
 
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:>2}% ", pct), Style::default().fg(Color::Green)),
-                                  Span::styled(u_f, Style::default().fg(Color::Green)),
-                                  Span::styled(u_e, Style::default().fg(Color::DarkGray)),
-                                  Span::raw("  "),
-                                  Span::styled(
-                                      format!("R:{:>5.1}M/s ", disk.read_mb_s),
-                                          Style::default().fg(r_col),
-                                  ),
-                                  Span::styled(
-                                      format!("W:{:>5.1}M/s", disk.write_mb_s),
-                                          Style::default().fg(w_col),
-                                  ),
-            ]));
+            if compact_mode {
+                // Responsive Wrapped Layout for narrower panels (3 lines per disk with tree markers)
+                let stats_str = format!("T:{:>4.0}G F:{:>4.0}G", disk.total_gb, disk.avail_gb);
+                let max_lbl = usable_w.saturating_sub(stats_str.len() + 1).max(6);
+                let mut lbl = disk.label.clone();
+                if lbl.len() > max_lbl {
+                    lbl.truncate(max_lbl.saturating_sub(1));
+                    lbl.push('~');
+                }
+
+                // Line 1: Disk Name + Total & Free Space aligned cleanly
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<width$} ", lbl, width = max_lbl),
+                            Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("T:{:>4.0}G ", disk.total_gb),
+                            Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("F:{:>4.0}G", disk.avail_gb),
+                            Style::default().fg(Color::LightGreen),
+                    ),
+                ]));
+
+                // Line 2: Indented Usage Bar
+                let bar_w = usable_w.saturating_sub(9).clamp(6, 20);
+                let (u_f, u_e) = make_block_bar(pct, bar_w);
+                lines.push(Line::from(vec![
+                    Span::styled(" ├─ ", Style::default().fg(Color::DarkGray)),
+                                      Span::styled(format!("{:>2}% ", pct), Style::default().fg(Color::Green)),
+                                      Span::styled(u_f, Style::default().fg(Color::Green)),
+                                      Span::styled(u_e, Style::default().fg(Color::DarkGray)),
+                ]));
+
+                // Line 3: Indented Live Read / Write I/O below the bar
+                lines.push(Line::from(vec![
+                    Span::styled(" └─ ", Style::default().fg(Color::DarkGray)),
+                                      Span::styled(
+                                          format!("R:{:>5.1}M/s  ", disk.read_mb_s),
+                                              Style::default().fg(r_col),
+                                      ),
+                                      Span::styled(
+                                          format!("W:{:>5.1}M/s", disk.write_mb_s),
+                                              Style::default().fg(w_col),
+                                      ),
+                ]));
+            } else {
+                // Wide Layout (2 lines per disk when panel is >= 38 columns wide)
+                let (u_f, u_e) = make_block_bar(pct, 10);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<16}", disk.label),
+                            Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("Tot:{:>4.0}G  ", disk.total_gb),
+                            Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(
+                        format!("Free:{:>4.0}G", disk.avail_gb),
+                            Style::default().fg(Color::LightGreen),
+                    ),
+                ]));
+
+                lines.push(Line::from(vec![
+                    Span::styled(" └─ ", Style::default().fg(Color::DarkGray)),
+                                      Span::styled(format!("{:>2}% ", pct), Style::default().fg(Color::Green)),
+                                      Span::styled(u_f, Style::default().fg(Color::Green)),
+                                      Span::styled(u_e, Style::default().fg(Color::DarkGray)),
+                                      Span::raw("  "),
+                                      Span::styled(
+                                          format!("R:{:>5.1}M/s ", disk.read_mb_s),
+                                              Style::default().fg(r_col),
+                                      ),
+                                      Span::styled(
+                                          format!("W:{:>5.1}M/s", disk.write_mb_s),
+                                              Style::default().fg(w_col),
+                                      ),
+                ]));
+            }
         }
 
         f.render_widget(Paragraph::new(lines), inner);
